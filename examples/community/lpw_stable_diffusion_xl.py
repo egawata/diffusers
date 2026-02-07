@@ -187,6 +187,12 @@ def get_prompts_tokens_with_weights(clip_tokenizer: CLIPTokenizer, prompt: str):
     texts_and_weights = parse_prompt_attention(prompt)
     text_tokens, text_weights = [], []
     for word, weight in texts_and_weights:
+        # Handle BREAK keyword - add a special marker instead of tokenizing
+        if word == "BREAK" and weight == -1:
+            text_tokens.append(-1)  # Special marker for BREAK
+            text_weights.append(-1)
+            continue
+
         # tokenize and discard the starting and the ending token
         token = clip_tokenizer(word, truncation=False).input_ids[1:-1]  # so that tokenize whatever length prompt
         # the returned token is a 1d list: [320, 1125, 539, 320]
@@ -229,28 +235,57 @@ def group_tokens_and_weights(token_ids: list, weights: list, pad_last_block=Fals
     # this will be a 2d list
     new_token_ids = []
     new_weights = []
-    while len(token_ids) >= 75:
-        # get the first 75 tokens
-        head_75_tokens = [token_ids.pop(0) for _ in range(75)]
-        head_75_weights = [weights.pop(0) for _ in range(75)]
 
-        # extract token ids and weights
-        temp_77_token_ids = [bos] + head_75_tokens + [eos]
-        temp_77_weights = [1.0] + head_75_weights + [1.0]
+    # Current chunk being built
+    current_tokens = []
+    current_weights = []
 
-        # add 77 token and weights chunk to the holder list
+    def finalize_chunk(is_last=False):
+        """Finalize the current chunk with padding and add to results"""
+        nonlocal current_tokens, current_weights
+        if len(current_tokens) == 0 and not is_last:
+            return
+
+        # Pad to 75 tokens if needed (always pad on BREAK, optionally on last)
+        padding_len = 75 - len(current_tokens)
+        if padding_len > 0:
+            current_tokens += [eos] * padding_len
+            current_weights += [1.0] * padding_len
+
+        # Add BOS and EOS tokens
+        temp_77_token_ids = [bos] + current_tokens[:75] + [eos]
+        temp_77_weights = [1.0] + current_weights[:75] + [1.0]
+
         new_token_ids.append(temp_77_token_ids)
         new_weights.append(temp_77_weights)
 
-    # padding the left
-    if len(token_ids) > 0:
-        padding_len = 75 - len(token_ids) if pad_last_block else 0
+        # Reset for next chunk
+        current_tokens = []
+        current_weights = []
 
-        temp_77_token_ids = [bos] + token_ids + [eos] * padding_len + [eos]
-        new_token_ids.append(temp_77_token_ids)
+    for token_id, weight in zip(token_ids, weights):
+        # Handle BREAK marker - finalize current chunk with padding
+        if token_id == -1 and weight == -1:
+            finalize_chunk()
+            continue
 
-        temp_77_weights = [1.0] + weights + [1.0] * padding_len + [1.0]
-        new_weights.append(temp_77_weights)
+        current_tokens.append(token_id)
+        current_weights.append(weight)
+
+        # If we've reached 75 tokens, finalize the chunk
+        if len(current_tokens) == 75:
+            finalize_chunk()
+
+    # Handle remaining tokens
+    if len(current_tokens) > 0:
+        if not pad_last_block:
+            # Don't pad the last block - just add what we have
+            temp_77_token_ids = [bos] + current_tokens + [eos]
+            temp_77_weights = [1.0] + current_weights + [1.0]
+            new_token_ids.append(temp_77_token_ids)
+            new_weights.append(temp_77_weights)
+        else:
+            finalize_chunk(is_last=True)
 
     return new_token_ids, new_weights
 
@@ -357,19 +392,48 @@ def get_weighted_text_embeddings_sdxl(
     embeds = []
     neg_embeds = []
 
-    prompt_token_groups, prompt_weight_groups = group_tokens_and_weights(prompt_tokens.copy(), prompt_weights.copy())
+    prompt_token_groups, prompt_weight_groups = group_tokens_and_weights(
+        prompt_tokens.copy(), prompt_weights.copy(), pad_last_block=True
+    )
 
     neg_prompt_token_groups, neg_prompt_weight_groups = group_tokens_and_weights(
-        neg_prompt_tokens.copy(), neg_prompt_weights.copy()
+        neg_prompt_tokens.copy(), neg_prompt_weights.copy(), pad_last_block=True
     )
 
     prompt_token_groups_2, prompt_weight_groups_2 = group_tokens_and_weights(
-        prompt_tokens_2.copy(), prompt_weights_2.copy()
+        prompt_tokens_2.copy(), prompt_weights_2.copy(), pad_last_block=True
     )
 
     neg_prompt_token_groups_2, neg_prompt_weight_groups_2 = group_tokens_and_weights(
-        neg_prompt_tokens_2.copy(), neg_prompt_weights_2.copy()
+        neg_prompt_tokens_2.copy(), neg_prompt_weights_2.copy(), pad_last_block=True
     )
+
+    # Pad chunk counts to match between all prompt groups
+    # This is needed when BREAK creates different chunk counts
+    bos, eos = 49406, 49407
+    empty_chunk = [bos] + [eos] * 75 + [eos]  # 77 tokens: BOS + 75 EOS padding + EOS
+    empty_weights = [1.0] * 77
+
+    # All groups must have the same chunk count
+    max_chunks = max(
+        len(prompt_token_groups),
+        len(neg_prompt_token_groups),
+        len(prompt_token_groups_2),
+        len(neg_prompt_token_groups_2),
+    )
+
+    while len(prompt_token_groups) < max_chunks:
+        prompt_token_groups.append(list(empty_chunk))
+        prompt_weight_groups.append(list(empty_weights))
+    while len(neg_prompt_token_groups) < max_chunks:
+        neg_prompt_token_groups.append(list(empty_chunk))
+        neg_prompt_weight_groups.append(list(empty_weights))
+    while len(prompt_token_groups_2) < max_chunks:
+        prompt_token_groups_2.append(list(empty_chunk))
+        prompt_weight_groups_2.append(list(empty_weights))
+    while len(neg_prompt_token_groups_2) < max_chunks:
+        neg_prompt_token_groups_2.append(list(empty_chunk))
+        neg_prompt_weight_groups_2.append(list(empty_weights))
 
     # get prompt embeddings one by one is not working.
     for i in range(len(prompt_token_groups)):
