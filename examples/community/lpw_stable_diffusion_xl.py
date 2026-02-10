@@ -50,6 +50,10 @@ from diffusers.utils.torch_utils import randn_tensor
 if is_invisible_watermark_available():
     from diffusers.pipelines.stable_diffusion_xl.watermark import StableDiffusionXLWatermarker
 
+# CLIP tokenizer special tokens
+BOS_TOKEN_ID = 49406
+EOS_TOKEN_ID = 49407
+
 
 def parse_prompt_attention(text):
     """
@@ -230,7 +234,7 @@ def group_tokens_and_weights(token_ids: list, weights: list, pad_last_block=Fals
             , weights = token_weight_list
         )
     """
-    bos, eos = 49406, 49407
+    bos, eos = BOS_TOKEN_ID, EOS_TOKEN_ID
 
     # this will be a 2d list
     new_token_ids = []
@@ -240,13 +244,11 @@ def group_tokens_and_weights(token_ids: list, weights: list, pad_last_block=Fals
     current_tokens = []
     current_weights = []
 
-    def finalize_chunk(is_last=False):
+    def finalize_chunk():
         """Finalize the current chunk with padding and add to results"""
         nonlocal current_tokens, current_weights
-        if len(current_tokens) == 0 and not is_last:
-            return
 
-        # Pad to 75 tokens if needed (always pad on BREAK, optionally on last)
+        # Pad to 75 tokens if needed
         padding_len = 75 - len(current_tokens)
         if padding_len > 0:
             current_tokens += [eos] * padding_len
@@ -276,16 +278,17 @@ def group_tokens_and_weights(token_ids: list, weights: list, pad_last_block=Fals
         if len(current_tokens) == 75:
             finalize_chunk()
 
-    # Handle remaining tokens
-    if len(current_tokens) > 0:
-        if not pad_last_block:
+    # Handle remaining tokens (matches A1111 behavior)
+    # Add final chunk if there are remaining tokens OR if no chunks exist yet
+    if len(current_tokens) > 0 or len(new_token_ids) == 0:
+        if not pad_last_block and len(current_tokens) > 0:
             # Don't pad the last block - just add what we have
             temp_77_token_ids = [bos] + current_tokens + [eos]
             temp_77_weights = [1.0] + current_weights + [1.0]
             new_token_ids.append(temp_77_token_ids)
             new_weights.append(temp_77_weights)
         else:
-            finalize_chunk(is_last=True)
+            finalize_chunk()
 
     return new_token_ids, new_weights
 
@@ -410,7 +413,7 @@ def get_weighted_text_embeddings_sdxl(
 
     # Pad chunk counts to match between all prompt groups
     # This is needed when BREAK creates different chunk counts
-    bos, eos = 49406, 49407
+    bos, eos = BOS_TOKEN_ID, EOS_TOKEN_ID
     empty_chunk = [bos] + [eos] * 75 + [eos]  # 77 tokens: BOS + 75 EOS padding + EOS
     empty_weights = [1.0] * 77
 
